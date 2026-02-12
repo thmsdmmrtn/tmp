@@ -1,0 +1,86 @@
+FROM alpine:3.21.6
+
+# Build arguments for user/group IDs
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# Define all Node.js versions to install
+ARG NODE_VERSIONS="16.20.2 18.20.5 20.18.1 21.7.3 22.12.0 23.5.0"
+ARG NODE_DEFAULT="20.18.1"
+
+# Set environment variables
+ENV NVM_DIR=/home/jenkins/.nvm \
+    NODE_VERSION=${NODE_DEFAULT}
+
+# Single RUN layer for all system setup to minimize layers
+RUN apk add --no-cache \
+    # Build dependencies (will be removed later)
+    --virtual .build-deps \
+    curl \
+    # Runtime dependencies
+    bash \
+    git \
+    openssh-client \
+    ca-certificates \
+    libstdc++ \
+    # Create jenkins user/group
+    && addgroup -g ${GROUP_ID} jenkins \
+    && adduser -D -u ${USER_ID} -G jenkins -s /bin/bash jenkins \
+    # Install NVM as jenkins user
+    && su jenkins -c ' \
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \
+        && . "$NVM_DIR/nvm.sh" \
+        # Install all Node versions in one go
+        && for version in '"${NODE_VERSIONS}"'; do \
+            echo "Installing Node.js $version..." \
+            && nvm install "$version" --no-progress; \
+        done \
+        # Set default version
+        && nvm alias default '"${NODE_DEFAULT}"' \
+        # Clear NVM cache to reduce image size
+        && nvm cache clear \
+        # Remove unnecessary files
+        && find "$NVM_DIR" -type f -name "*.md" -delete \
+        && find "$NVM_DIR" -type f -name "CHANGELOG*" -delete \
+        && find "$NVM_DIR" -type d -name "share" -exec rm -rf {} + 2>/dev/null || true \
+    ' \
+    # Clean up build dependencies
+    && apk del .build-deps \
+    # Clean up apk cache
+    && rm -rf /var/cache/apk/*
+
+# Switch to jenkins user
+USER jenkins
+WORKDIR /home/jenkins
+
+# Configure bash to auto-load NVM
+RUN echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc \
+    && echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.bashrc \
+    && echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc
+
+# Create helper script for automatic .nvmrc detection
+RUN echo '#!/bin/bash\n\
+export NVM_DIR="$HOME/.nvm"\n\
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"\n\
+\n\
+if [ -f ".nvmrc" ]; then\n\
+    echo "Found .nvmrc, using specified version..."\n\
+    nvm use || { echo "Version not found, installing..." && nvm install; }\n\
+else\n\
+    nvm use default\n\
+fi\n\
+\n\
+echo "Node.js: $(node --version)"\n\
+echo "npm: $(npm --version)"\n\
+\n\
+exec "$@"' > /home/jenkins/nvm-exec.sh \
+    && chmod +x /home/jenkins/nvm-exec.sh
+
+# Add default node to PATH for convenience
+ENV PATH="/home/jenkins/.nvm/versions/node/v${NODE_DEFAULT}/bin:${PATH}"
+
+# Health check script to verify node is available
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=1 \
+    CMD node --version || exit 1
+
+CMD ["/bin/bash"]
